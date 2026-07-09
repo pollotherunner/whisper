@@ -247,13 +247,6 @@ def _try_start_evdev(listener: HotkeyListener) -> bool:
     return True
 
 
-def _spec_to_codes(spec: HotkeySpec) -> tuple[set[int], int]:
-    mods: set[int] = set()
-    for m in spec.modifiers:
-        mods |= MOD_CODES[m]
-    return mods, KEY_CODES[spec.key]
-
-
 def _try_start_pynput(listener: HotkeyListener) -> bool:
     try:
         from pynput import keyboard
