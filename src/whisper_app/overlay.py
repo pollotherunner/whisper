@@ -258,14 +258,14 @@ class OverlayWindow(QWidget):
             if not self._dragging and not self._use_system_move:
                 self._apply_anchor()
 
-        # While recording, if mic is quiet for a moment, keep a tiny resting pulse
-        # (only inject when envelope already low — never lags real speech).
-        if self._mode == "recording" and self._envelope < 0.04:
-            idle = 0.045 + 0.02 * (0.5 + 0.5 * math.sin(self._phase * 1.2))
-            self._envelope *= 0.9
-            self._levels.append(idle)
+        # Sample envelope → scrolling history at display rate (~60 fps)
+        if self._mode == "recording":
+            env = self._envelope
+            if env < 0.04:
+                # gentle resting pulse only when truly quiet
+                env = 0.04 + 0.02 * (0.5 + 0.5 * math.sin(self._phase * 1.2))
+            self._levels.append(env)
         elif self._mode == "processing":
-            # synthetic soft wave while ASR runs
             n = self._levels.maxlen or 48
             t = self._phase
             self._levels = deque(
