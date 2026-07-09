@@ -54,7 +54,7 @@ class WhisperApp(QObject):
         self.bridge.level.connect(self.overlay.set_level)
         self.bridge.show_recording.connect(self.overlay.show_recording)
         self.bridge.show_processing.connect(self.overlay.show_processing)
-        self.bridge.hide_overlay.connect(self.overlay.hide_overlay)
+        self.bridge.hide_overlay.connect(self.overlay.show_idle)
         self.bridge.paste.connect(self._do_paste)
         self.bridge.error.connect(self._on_error)
         self.bridge.status.connect(lambda m: log.info("%s", m))
@@ -72,6 +72,8 @@ class WhisperApp(QObject):
 
     def start(self) -> None:
         self._setup_tray("Loading model…")
+        # Always-visible mini indicator (user can drag it anywhere)
+        self.overlay.show_idle()
         # Load model in background so the event loop is responsive
         threading.Thread(target=self._load_model, name="asr-load", daemon=True).start()
 
