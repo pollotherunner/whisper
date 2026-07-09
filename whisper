@@ -5,12 +5,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 if [[ ! -d "$ROOT/.venv" ]]; then
-  echo "[whisper] creating virtualenv (first run)..."
+  echo "[whisper] first run: creating venv + installing dependencies..."
   if ! command -v uv >/dev/null 2>&1; then
     echo "error: 'uv' is required (https://github.com/astral-sh/uv)" >&2
     exit 1
   fi
   uv venv --python 3.12 "$ROOT/.venv"
+
+  # Prefer NVIDIA CUDA wheels when a GPU driver is present; else default (CPU / ROCm env).
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "[whisper] NVIDIA driver detected — installing PyTorch with CUDA..."
+    uv pip install --python "$ROOT/.venv/bin/python" \
+      torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+  else
+    echo "[whisper] installing PyTorch (default wheels — CPU or ROCm if configured)..."
+    uv pip install --python "$ROOT/.venv/bin/python" torch torchaudio
+  fi
   uv pip install --python "$ROOT/.venv/bin/python" -e "$ROOT"
 fi
 

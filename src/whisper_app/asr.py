@@ -37,7 +37,6 @@ def ensure_model(cfg: ModelConfig) -> Path:
     snapshot_download(
         repo_id=cfg.repo_id,
         local_dir=str(local_dir),
-        local_dir_use_symlinks=False,
     )
     if not model_is_ready(local_dir):
         raise RuntimeError(f"Download finished but {MODEL_MARKER} missing in {local_dir}")
@@ -82,17 +81,17 @@ class AsrEngine:
 
         log.info("Loading model (%s / %s)...", info.backend, info.name)
         def _load(device_info: DeviceInfo):
-            # transformers API: prefer torch_dtype (widely supported), fall back to dtype
+            # transformers: `dtype` is current; older builds used torch_dtype
             try:
                 m = model_cls.from_pretrained(
                     str(local_dir),
-                    torch_dtype=device_info.dtype,
+                    dtype=device_info.dtype,
                     local_files_only=True,
                 )
             except TypeError:
                 m = model_cls.from_pretrained(
                     str(local_dir),
-                    dtype=device_info.dtype,
+                    torch_dtype=device_info.dtype,
                     local_files_only=True,
                 )
             m.to(device_info.device)
@@ -127,8 +126,6 @@ class AsrEngine:
             sample_rate = 16000
 
         inputs = self.processor(audio, sampling_rate=sample_rate, return_tensors="pt")
-        # Move tensors
-        move_kwargs = {}
         for k, v in list(inputs.items()):
             if hasattr(v, "to"):
                 inputs[k] = v.to(self.device_info.device)
@@ -137,12 +134,16 @@ class AsrEngine:
 
         try:
             # Parakeet TDT generate API
-            output = self.model.generate(**inputs, return_dict_in_generate=True)
+            output = self.model.generate(
+                **inputs,
+                return_dict_in_generate=True,
+                max_new_tokens=1024,
+            )
             sequences = getattr(output, "sequences", output)
             text = self.processor.decode(sequences, skip_special_tokens=True)
         except TypeError:
             # Fallback: pipeline-style or older generate
-            output = self.model.generate(**inputs)
+            output = self.model.generate(**inputs, max_new_tokens=1024)
             text = self.processor.batch_decode(output, skip_special_tokens=True)
 
         if isinstance(text, list):

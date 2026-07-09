@@ -6,7 +6,7 @@ import logging
 import threading
 from enum import Enum, auto
 
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Signal, Slot
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor
 
@@ -36,6 +36,7 @@ class Bridge(QObject):
     paste = Signal(str)
     error = Signal(str)
     status = Signal(str)
+    model_ready = Signal(str)
 
 
 class WhisperApp(QObject):
@@ -57,6 +58,7 @@ class WhisperApp(QObject):
         self.bridge.paste.connect(self._do_paste)
         self.bridge.error.connect(self._on_error)
         self.bridge.status.connect(lambda m: log.info("%s", m))
+        self.bridge.model_ready.connect(self._on_ready)
 
         self.recorder = AudioRecorder(
             sample_rate=cfg.audio.sample_rate,
@@ -78,11 +80,12 @@ class WhisperApp(QObject):
             info = self.engine.load()
             msg = f"Ready on {info.name} ({info.backend})"
             self.bridge.status.emit(msg)
-            QTimer.singleShot(0, lambda: self._on_ready(msg))
+            self.bridge.model_ready.emit(msg)
         except Exception as exc:
             log.exception("Failed to load model")
             self.bridge.error.emit(f"Model load failed: {exc}")
 
+    @Slot(str)
     def _on_ready(self, msg: str) -> None:
         self._setup_tray(msg)
         try:
