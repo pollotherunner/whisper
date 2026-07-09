@@ -47,9 +47,11 @@ class AudioRecorder:
             with self._lock:
                 self._frames.append(chunk.astype(np.float32, copy=False))
             if self.on_level is not None:
-                # RMS level 0..1-ish for waveform
+                # Peak + RMS hybrid — peak tracks speech onset immediately
+                peak = float(np.max(np.abs(chunk)) + 1e-12)
                 rms = float(np.sqrt(np.mean(np.square(chunk))) + 1e-12)
-                self.on_level(min(1.0, rms * 8.0))
+                level = max(peak * 1.8, rms * 6.0)
+                self.on_level(min(1.0, level))
 
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
@@ -57,7 +59,8 @@ class AudioRecorder:
             dtype="float32",
             device=self.device,
             callback=callback,
-            blocksize=1024,
+            # Smaller blocks → level updates ~4× more often (256/16k ≈ 16ms)
+            blocksize=256,
         )
         self._stream.start()
         log.info("Recording started (sr=%s device=%s)", self.sample_rate, self.device)

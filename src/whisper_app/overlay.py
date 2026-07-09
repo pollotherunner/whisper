@@ -61,8 +61,10 @@ class OverlayWindow(QWidget):
 
         self.show_waveform = show_waveform
         self._mode = "idle"  # idle | recording | processing
-        self._levels: deque[float] = deque([0.0] * 48, maxlen=48)
-        self._smooth: deque[float] = deque([0.06] * 48, maxlen=48)
+        # Rolling history drawn left→right (oldest→newest). No heavy EMA on the buffer.
+        self._levels: deque[float] = deque([0.06] * 48, maxlen=48)
+        # Single live envelope (fast attack / medium release) drives new samples
+        self._envelope = 0.0
         self._phase = 0.0
         self._hotkey_label = "Ctrl+Space"
         self._font = self._pick_font()
@@ -104,7 +106,17 @@ class OverlayWindow(QWidget):
         self.update()
 
     def set_level(self, level: float) -> None:
-        self._levels.append(max(0.0, min(1.0, float(level))))
+        """Update live envelope only (called from audio thread via signal).
+
+        History is sampled in `_tick` at display rate so the wave stays in
+        lockstep with the UI — no delayed queue of old samples.
+        """
+        raw = max(0.0, min(1.0, float(level)))
+        # Fast attack / medium-short release
+        if raw >= self._envelope:
+            self._envelope = self._envelope * 0.15 + raw * 0.85
+        else:
+            self._envelope = self._envelope * 0.78 + raw * 0.22
 
     def show_idle(self) -> None:
         self._mode = "idle"
@@ -246,33 +258,26 @@ class OverlayWindow(QWidget):
             if not self._dragging and not self._use_system_move:
                 self._apply_anchor()
 
-        # Waveform smoothing
-        raw = list(self._levels)
-        n = len(raw)
-        if self._mode == "processing":
-            raw = [
-                0.16 + 0.18 * (0.5 + 0.5 * math.sin(self._phase * 1.3 + i * 0.25))
-                for i in range(n)
-            ]
+        # While recording, if mic is quiet for a moment, keep a tiny resting pulse
+        # (only inject when envelope already low — never lags real speech).
+        if self._mode == "recording" and self._envelope < 0.04:
+            idle = 0.045 + 0.02 * (0.5 + 0.5 * math.sin(self._phase * 1.2))
+            self._envelope *= 0.9
+            self._levels.append(idle)
+        elif self._mode == "processing":
+            # synthetic soft wave while ASR runs
+            n = self._levels.maxlen or 48
+            t = self._phase
+            self._levels = deque(
+                (
+                    0.14 + 0.16 * (0.5 + 0.5 * math.sin(t * 1.3 + i * 0.28))
+                    for i in range(n)
+                ),
+                maxlen=n,
+            )
         elif self._mode == "idle":
-            raw = [0.0] * n
-        elif self._mode == "recording" and (not raw or max(raw) < 0.035):
-            raw = [
-                0.05 + 0.025 * (0.5 + 0.5 * math.sin(self._phase + i * 0.2))
-                for i in range(n)
-            ]
+            self._envelope = 0.0
 
-        prev = list(self._smooth)
-        alpha = 0.32
-        smooth = []
-        for i, r in enumerate(raw):
-            p = prev[i] if i < len(prev) else r
-            smooth.append(p * (1 - alpha) + r * alpha)
-        # spatial soften
-        out = smooth[:]
-        for i in range(1, len(smooth) - 1):
-            out[i] = smooth[i - 1] * 0.18 + smooth[i] * 0.64 + smooth[i + 1] * 0.18
-        self._smooth = deque(out, maxlen=self._smooth.maxlen)
         self.update()
 
     def _content_rect(self) -> QRectF:
@@ -414,37 +419,47 @@ class OverlayWindow(QWidget):
         # Strict vertical band inside inner rect
         max_half = max(4.0, inner.height() * 0.42)
         mid = cy
-        levels = list(self._smooth)
+        levels = list(self._levels)
         if not levels:
             return
 
-        # ~28 soft bars
-        target_bars = 28
-        step = max(1, len(levels) // target_bars)
-        samples = levels[::step][:target_bars]
+        # Draw history as-is (newest on the right). Light 3-tap blur for
+        # cosmetics only — does not delay new samples at the edge.
+        n = len(levels)
+        display = levels[:]
+        if n >= 3:
+            display = [levels[0]] + [
+                levels[i - 1] * 0.15 + levels[i] * 0.70 + levels[i + 1] * 0.15
+                for i in range(1, n - 1)
+            ] + [levels[-1]]  # keep newest sample unblurred for instant feel
+
+        target_bars = 32
+        step = max(1, len(display) // target_bars)
+        samples = display[::step][:target_bars]
+        # ensure the last sample is always the freshest level
+        if samples and display:
+            samples[-1] = display[-1]
         count = len(samples)
         if count == 0:
             return
 
-        gap = 2.2
-        bar_w = max(2.2, (wave_right - wave_left - gap * (count - 1)) / count)
-        # Cap bar width so we never overflow horizontally
+        gap = 2.0
+        bar_w = max(2.0, (wave_right - wave_left - gap * (count - 1)) / count)
         total = count * bar_w + (count - 1) * gap
         if total > (wave_right - wave_left):
             bar_w = max(1.8, (wave_right - wave_left - gap * (count - 1)) / count)
 
         grad = QLinearGradient(wave_left, 0, wave_right, 0)
         grad.setColorAt(0.0, _WAVE_DIM)
-        grad.setColorAt(0.5, _WAVE)
-        grad.setColorAt(1.0, _WAVE_DIM)
+        grad.setColorAt(0.55, _WAVE)
+        grad.setColorAt(1.0, _WAVE)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(grad)
 
         x = wave_left
-        for i, lv in enumerate(samples):
-            amp = max(0.1, min(1.0, float(lv)))
+        for lv in samples:
+            amp = max(0.08, min(1.0, float(lv)))
             h = max(3.0, amp * max_half * 2.0)
-            # hard clamp inside inner vertical bounds
             h = min(h, inner.height() - 2.0)
             rr = min(bar_w * 0.5, 2.5)
             painter.drawRoundedRect(
