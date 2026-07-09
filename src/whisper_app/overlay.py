@@ -18,65 +18,69 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-# Dark palette — low contrast chrome, soft accent
-_BG = QColor(18, 18, 22, 235)
-_BG_IDLE = QColor(22, 22, 28, 220)
-_BORDER = QColor(255, 255, 255, 22)
-_BORDER_ACTIVE = QColor(255, 255, 255, 36)
-_TEXT = QColor(232, 232, 237)
-_MUTED = QColor(130, 130, 142)
-_WAVE = QColor(220, 220, 230, 210)
-_WAVE_SOFT = QColor(160, 160, 175, 140)
-_ACCENT = QColor(255, 82, 82)  # soft record red
-_ACCENT_GLOW = QColor(255, 82, 82, 55)
-_PROCESS = QColor(140, 160, 255)
+# Dark palette
+_BG = QColor(20, 20, 24, 242)
+_BG_IDLE = QColor(24, 24, 30, 235)
+_BORDER = QColor(255, 255, 255, 28)
+_BORDER_ACTIVE = QColor(255, 255, 255, 40)
+_TEXT = QColor(236, 236, 240)
+_MUTED = QColor(120, 120, 132)
+_WAVE = QColor(230, 230, 238, 220)
+_WAVE_DIM = QColor(150, 150, 165, 150)
+_ACCENT = QColor(255, 90, 90)
+_ACCENT_SOFT = QColor(255, 90, 90, 70)
+_PROCESS = QColor(150, 170, 255)
 
 
 class OverlayWindow(QWidget):
-    """Always-on-top frameless pill: tiny idle dot ↔ expanded recording UI."""
+    """Always-on-top frameless pill: mini idle pill ↔ expanded recording UI."""
 
     cancel_clicked = Signal()
     stop_clicked = Signal()
 
-    # Layout sizes (content + soft margin for shadow)
-    _IDLE_W, _IDLE_H = 44, 44
-    _ACTIVE_W, _ACTIVE_H = 360, 72
-    _MARGIN = 10
+    # Content sizes (window adds margin for soft shadow)
+    _IDLE_W, _IDLE_H = 72, 28
+    _ACTIVE_W, _ACTIVE_H = 380, 68
+    _MARGIN = 12
 
     def __init__(self, show_waveform: bool = True) -> None:
+        # Framed as a normal always-on-top window (Tool flag breaks mouse drag on some Wayland setups).
         super().__init__(
             None,
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
+            Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Window
             | Qt.WindowType.WindowDoesNotAcceptFocus,
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
         self.show_waveform = show_waveform
         self._mode = "idle"  # idle | recording | processing
-        self._levels: deque[float] = deque([0.0] * 56, maxlen=56)
-        self._smooth: deque[float] = deque([0.04] * 56, maxlen=56)
+        self._levels: deque[float] = deque([0.0] * 48, maxlen=48)
+        self._smooth: deque[float] = deque([0.06] * 48, maxlen=48)
         self._phase = 0.0
         self._hotkey_label = "Ctrl+Space"
         self._font = self._pick_font()
 
-        # animated size (lerp toward target)
         self._cur_w = float(self._IDLE_W + self._MARGIN * 2)
         self._cur_h = float(self._IDLE_H + self._MARGIN * 2)
         self._target_w = self._cur_w
         self._target_h = self._cur_h
-        self._anchor: QPoint | None = None  # center of pill in screen coords
-        self._drag_offset: QPoint | None = None
+        self._anchor: QPoint | None = None
+        self._dragging = False
+        self._drag_offset = QPoint()
         self._user_moved = False
+        self._use_system_move = False
 
-        self.resize(int(self._cur_w), int(self._cur_h))
+        self.setFixedSize(int(self._cur_w), int(self._cur_h))
 
         self._timer = QTimer(self)
-        self._timer.setInterval(16)  # ~60fps for smooth waves/resize
+        self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
 
     # ── public API ──────────────────────────────────────────────
@@ -87,11 +91,12 @@ class OverlayWindow(QWidget):
             p = p.strip()
             if not p:
                 continue
-            if p.lower() in ("ctrl", "control"):
+            low = p.lower()
+            if low in ("ctrl", "control"):
                 parts.append("Ctrl")
-            elif p.lower() == "space":
+            elif low == "space":
                 parts.append("Space")
-            elif p.lower() in ("esc", "escape"):
+            elif low in ("esc", "escape"):
                 parts.append("Esc")
             else:
                 parts.append(p[:1].upper() + p[1:].lower())
@@ -99,8 +104,7 @@ class OverlayWindow(QWidget):
         self.update()
 
     def set_level(self, level: float) -> None:
-        raw = max(0.0, min(1.0, float(level)))
-        self._levels.append(raw)
+        self._levels.append(max(0.0, min(1.0, float(level))))
 
     def show_idle(self) -> None:
         self._mode = "idle"
@@ -127,49 +131,69 @@ class OverlayWindow(QWidget):
         self.update()
 
     def hide_overlay(self) -> None:
-        """Back-compat: return to idle mini indicator (never fully hide)."""
         self.show_idle()
 
-    # ── interaction ─────────────────────────────────────────────
+    # ── interaction (Wayland-safe drag) ─────────────────────────
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        # Prefer compositor-native move (works on Wayland/KDE)
+        handle = self.windowHandle()
+        if handle is not None:
+            try:
+                self._use_system_move = bool(handle.startSystemMove())
+            except Exception:
+                self._use_system_move = False
+        else:
+            self._use_system_move = False
+
+        if not self._use_system_move:
+            # Manual fallback (X11 / if system move unavailable)
+            self._dragging = True
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            event.accept()
+
+        self._user_moved = True
+        event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            top_left = event.globalPosition().toPoint() - self._drag_offset
-            self.move(top_left)
-            self._anchor = self._center_from_geometry()
-            self._user_moved = True
-            event.accept()
+        if self._dragging and not self._use_system_move:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                top_left = event.globalPosition().toPoint() - self._drag_offset
+                self.move(top_left)
+                self._anchor = self._center_from_geometry()
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_offset = None
+            if self._dragging or self._use_system_move:
+                self._anchor = self._center_from_geometry()
+                self._user_moved = True
+            self._dragging = False
+            self._use_system_move = False
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def moveEvent(self, event) -> None:  # noqa: N802
+        # Keep anchor in sync when compositor moves the window (system drag)
+        if self._dragging or self._use_system_move or self._user_moved:
+            self._anchor = self._center_from_geometry()
+        super().moveEvent(event)
 
     # ── internals ───────────────────────────────────────────────
 
     def _pick_font(self) -> QFont:
-        preferred = [
-            "Inter",
-            "SF Pro Text",
-            "Segoe UI",
-            "Noto Sans",
-            "Ubuntu",
-            "Cantarell",
-            "DejaVu Sans",
-        ]
+        preferred = ["Inter", "SF Pro Text", "Segoe UI", "Noto Sans", "Ubuntu", "Cantarell", "DejaVu Sans"]
         available = set(QFontDatabase.families())
         for name in preferred:
             if name in available:
                 f = QFont(name)
                 f.setStyleHint(QFont.StyleHint.SansSerif)
-                f.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
                 return f
         f = QFont()
         f.setStyleHint(QFont.StyleHint.SansSerif)
@@ -193,10 +217,7 @@ class OverlayWindow(QWidget):
         if screen is None:
             return
         geo = screen.availableGeometry()
-        # bottom-center-ish, a bit above the edge
-        cx = geo.x() + geo.width() // 2
-        cy = geo.y() + geo.height() - 56
-        self._anchor = QPoint(cx, cy)
+        self._anchor = QPoint(geo.x() + geo.width() // 2, geo.y() + geo.height() - 64)
         self._apply_anchor()
 
     def _center_from_geometry(self) -> QPoint:
@@ -204,7 +225,7 @@ class OverlayWindow(QWidget):
         return QPoint(g.x() + g.width() // 2, g.y() + g.height() // 2)
 
     def _apply_anchor(self) -> None:
-        if self._anchor is None:
+        if self._anchor is None or self._dragging:
             return
         x = self._anchor.x() - int(self._cur_w) // 2
         y = self._anchor.y() - int(self._cur_h) // 2
@@ -213,210 +234,224 @@ class OverlayWindow(QWidget):
     def _tick(self) -> None:
         self._phase += 0.07
 
-        # smooth size lerp (snappy ease)
+        # Size animation — skip re-anchoring while user is dragging
         aw = self._target_w - self._cur_w
         ah = self._target_h - self._cur_h
-        if abs(aw) > 0.3 or abs(ah) > 0.3:
-            self._cur_w += aw * 0.22
-            self._cur_h += ah * 0.22
-            # keep center fixed while resizing
+        if abs(aw) > 0.4 or abs(ah) > 0.4:
+            self._cur_w += aw * 0.28
+            self._cur_h += ah * 0.28
             if self._anchor is None:
                 self._anchor = self._center_from_geometry()
-            self.resize(max(1, int(round(self._cur_w))), max(1, int(round(self._cur_h))))
-            self._apply_anchor()
+            self.setFixedSize(max(1, int(round(self._cur_w))), max(1, int(round(self._cur_h))))
+            if not self._dragging and not self._use_system_move:
+                self._apply_anchor()
 
-        # smooth waveform levels (EMA)
+        # Waveform smoothing
         raw = list(self._levels)
+        n = len(raw)
         if self._mode == "processing":
-            # soft breathing wave
-            for i in range(len(raw)):
-                raw[i] = 0.18 + 0.22 * (0.5 + 0.5 * math.sin(self._phase * 1.4 + i * 0.22))
+            raw = [
+                0.16 + 0.18 * (0.5 + 0.5 * math.sin(self._phase * 1.3 + i * 0.25))
+                for i in range(n)
+            ]
         elif self._mode == "idle":
-            raw = [0.0] * len(raw)
-        elif self._mode == "recording" and (not raw or max(raw) < 0.04):
-            # gentle resting pulse while silent
-            for i in range(len(raw)):
-                raw[i] = 0.05 + 0.03 * (0.5 + 0.5 * math.sin(self._phase + i * 0.18))
+            raw = [0.0] * n
+        elif self._mode == "recording" and (not raw or max(raw) < 0.035):
+            raw = [
+                0.05 + 0.025 * (0.5 + 0.5 * math.sin(self._phase + i * 0.2))
+                for i in range(n)
+            ]
 
-        smooth = list(self._smooth)
-        alpha = 0.28
+        prev = list(self._smooth)
+        alpha = 0.32
+        smooth = []
         for i, r in enumerate(raw):
-            if i < len(smooth):
-                smooth[i] = smooth[i] * (1 - alpha) + r * alpha
-            else:
-                smooth.append(r)
-        # light spatial blur for creamier bars
-        blurred = smooth[:]
+            p = prev[i] if i < len(prev) else r
+            smooth.append(p * (1 - alpha) + r * alpha)
+        # spatial soften
+        out = smooth[:]
         for i in range(1, len(smooth) - 1):
-            blurred[i] = smooth[i - 1] * 0.2 + smooth[i] * 0.6 + smooth[i + 1] * 0.2
-        self._smooth = deque(blurred, maxlen=self._smooth.maxlen)
-
+            out[i] = smooth[i - 1] * 0.18 + smooth[i] * 0.64 + smooth[i + 1] * 0.18
+        self._smooth = deque(out, maxlen=self._smooth.maxlen)
         self.update()
+
+    def _content_rect(self) -> QRectF:
+        m = self._MARGIN
+        return QRectF(m, m, self.width() - m * 2, self.height() - m * 2)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-        m = self._MARGIN
-        rect = QRectF(m, m, self.width() - m * 2, self.height() - m * 2)
-        if rect.width() < 4 or rect.height() < 4:
+        rect = self._content_rect()
+        if rect.width() < 8 or rect.height() < 8:
             return
 
-        # soft drop shadow
-        shadow = QPainterPath()
-        shadow.addRoundedRect(rect.translated(0, 2), rect.height() / 2, rect.height() / 2)
-        painter.fillPath(shadow, QColor(0, 0, 0, 70))
-
-        # body
-        path = QPainterPath()
         radius = rect.height() / 2.0
-        path.addRoundedRect(rect, radius, radius)
-        bg = _BG if self._mode != "idle" else _BG_IDLE
-        painter.fillPath(path, bg)
-        painter.setPen(QPen(_BORDER_ACTIVE if self._mode != "idle" else _BORDER, 1.0))
-        painter.drawPath(path)
 
-        # While expanding/collapsing, only draw full chrome once wide enough
-        expanded_enough = rect.width() > (self._IDLE_W + self._ACTIVE_W) * 0.35
-        if self._mode == "idle" or not expanded_enough:
+        # shadow
+        shadow = QPainterPath()
+        shadow.addRoundedRect(rect.translated(0, 1.5), radius, radius)
+        painter.fillPath(shadow, QColor(0, 0, 0, 80))
+
+        # body pill
+        body = QPainterPath()
+        body.addRoundedRect(rect, radius, radius)
+        painter.fillPath(body, _BG if self._mode != "idle" else _BG_IDLE)
+        painter.setPen(QPen(_BORDER_ACTIVE if self._mode != "idle" else _BORDER, 1.0))
+        painter.drawPath(body)
+
+        # Clip ALL content to pill so nothing spills out
+        painter.setClipPath(body)
+
+        # Expanded only when wide enough for the full layout
+        ready = rect.width() >= self._ACTIVE_W * 0.72
+        if self._mode == "idle" or not ready:
             self._paint_idle(painter, rect)
-            if self._mode != "idle" and expanded_enough is False:
-                # accent pulse while growing into active state
-                cx, cy = rect.center().x(), rect.center().y()
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(_ACCENT if self._mode == "recording" else _PROCESS)
-                painter.drawEllipse(QPoint(int(cx), int(cy)), 3, 3)
         else:
             self._paint_active(painter, rect)
 
     def _paint_idle(self, painter: QPainter, rect: QRectF) -> None:
-        # subtle outer ring + soft center glow + accent core
-        cx = rect.center().x()
+        """Mini horizontal pill: soft bar + status dot — not a circle."""
         cy = rect.center().y()
-
-        # breathing glow
-        breath = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(self._phase * 0.9))
-        glow_r = 9 + 2 * breath
+        # left status dot
+        breath = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(self._phase * 0.85))
+        dot_x = rect.left() + 14
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, int(12 + 10 * breath)))
-        painter.drawEllipse(QPoint(int(cx), int(cy)), int(glow_r + 4), int(glow_r + 4))
+        painter.setBrush(QColor(255, 255, 255, int(28 + 20 * breath)))
+        painter.drawEllipse(QPoint(int(dot_x), int(cy)), 5, 5)
+        painter.setBrush(QColor(255, 255, 255, int(170 + 50 * breath)))
+        painter.drawEllipse(QPoint(int(dot_x), int(cy)), 2, 2)
 
-        painter.setBrush(QColor(255, 255, 255, 28))
-        painter.drawEllipse(QPoint(int(cx), int(cy)), 7, 7)
-
-        # tiny ready dot
-        painter.setBrush(QColor(255, 255, 255, int(160 + 60 * breath)))
-        painter.drawEllipse(QPoint(int(cx), int(cy)), 3, 3)
+        # quiet mini waveform ticks (decorative idle life)
+        left = dot_x + 12
+        right = rect.right() - 12
+        if right - left < 16:
+            return
+        mid = cy
+        bars = 9
+        gap = 2.5
+        bar_w = max(2.0, (right - left - gap * (bars - 1)) / bars)
+        painter.setBrush(QColor(255, 255, 255, int(40 + 25 * breath)))
+        x = left
+        for i in range(bars):
+            h = 3.0 + 4.0 * (0.45 + 0.55 * math.sin(self._phase * 1.1 + i * 0.7))
+            h = min(h, rect.height() - 10)
+            painter.drawRoundedRect(
+                QRectF(x, mid - h / 2, bar_w, h),
+                bar_w / 2,
+                bar_w / 2,
+            )
+            x += bar_w + gap
 
     def _paint_active(self, painter: QPainter, rect: QRectF) -> None:
-        # left status chip
-        pad = 14.0
-        chip_x = rect.left() + pad
-        mid_y = rect.center().y()
+        """Single clean row: [dot] Label | waveform | hint — all inside padding."""
+        pad_x = 16.0
+        pad_y = 14.0
+        inner = rect.adjusted(pad_x, pad_y, -pad_x, -pad_y)
+        if inner.width() < 40 or inner.height() < 10:
+            return
 
+        cy = inner.center().y()
+
+        # —— left status ——
+        status_x = inner.left()
         if self._mode == "recording":
-            # soft glow under record dot
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(_ACCENT_GLOW)
-            painter.drawEllipse(QPoint(int(chip_x + 5), int(mid_y)), 9, 9)
-            # pulse scale
-            pulse = 1.0 + 0.12 * (0.5 + 0.5 * math.sin(self._phase * 2.2))
-            r = 4.2 * pulse
+            painter.setBrush(_ACCENT_SOFT)
+            painter.drawEllipse(QPoint(int(status_x + 5), int(cy)), 8, 8)
+            pulse = 1.0 + 0.1 * (0.5 + 0.5 * math.sin(self._phase * 2.0))
+            r = 3.6 * pulse
             painter.setBrush(_ACCENT)
-            painter.drawEllipse(QPoint(int(chip_x + 5), int(mid_y)), int(r), int(r))
+            painter.drawEllipse(QPoint(int(status_x + 5), int(cy)), int(round(r)), int(round(r)))
             label = "Listening"
-            accent = _TEXT
         else:
-            # processing spinner arc
-            painter.setPen(QPen(_PROCESS, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.setPen(QPen(_PROCESS, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            start = int((self._phase * 55) % 360) * 16
-            painter.drawArc(int(chip_x - 2), int(mid_y - 7), 14, 14, start, 220 * 16)
+            start = int((self._phase * 50) % 360) * 16
+            painter.drawArc(int(status_x - 1), int(cy - 6), 12, 12, start, 240 * 16)
             label = "Transcribing"
-            accent = _TEXT
 
         font = QFont(self._font)
         font.setPixelSize(12)
         font.setWeight(QFont.Weight.Medium)
-        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.2)
         painter.setFont(font)
-        painter.setPen(accent)
-        text_x = chip_x + 18
+        painter.setPen(_TEXT)
         metrics = painter.fontMetrics()
-        painter.drawText(
-            int(text_x),
-            int(mid_y + metrics.ascent() / 2 - 1),
-            label,
+        label_x = status_x + 16
+        # vertical center via bounding rect (avoids baseline overflow)
+        label_rect = QRectF(
+            label_x,
+            inner.top(),
+            metrics.horizontalAdvance(label) + 2,
+            inner.height(),
         )
-        label_w = metrics.horizontalAdvance(label)
+        painter.drawText(label_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), label)
+        label_right = label_x + metrics.horizontalAdvance(label)
 
-        # right-side hint (minimal)
+        # —— right hint ——
         hint_font = QFont(self._font)
         hint_font.setPixelSize(11)
         hint_font.setWeight(QFont.Weight.Normal)
         painter.setFont(hint_font)
         painter.setPen(_MUTED)
-        if self._mode == "recording":
-            hint = self._hotkey_label
-        else:
-            hint = "…"
-        hint_w = painter.fontMetrics().horizontalAdvance(hint)
-        hint_x = rect.right() - pad - hint_w
-        painter.drawText(
-            int(hint_x),
-            int(mid_y + painter.fontMetrics().ascent() / 2 - 1),
-            hint,
-        )
+        hint = self._hotkey_label if self._mode == "recording" else "…"
+        h_metrics = painter.fontMetrics()
+        hint_w = h_metrics.horizontalAdvance(hint)
+        hint_rect = QRectF(inner.right() - hint_w, inner.top(), hint_w, inner.height())
+        painter.drawText(hint_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), hint)
 
-        # waveform between label and hint
+        # —— waveform band between label and hint ——
         if not self.show_waveform:
             return
 
-        wave_left = text_x + label_w + 16
-        wave_right = hint_x - 16
-        if wave_right - wave_left < 40:
+        wave_left = label_right + 14
+        wave_right = inner.right() - hint_w - 14
+        if wave_right - wave_left < 48:
             return
 
-        wave_top = rect.top() + 16
-        wave_bottom = rect.bottom() - 16
-        mid = (wave_top + wave_bottom) / 2.0
-        max_h = (wave_bottom - wave_top) / 2.0 * 0.92
-
+        # Strict vertical band inside inner rect
+        max_half = max(4.0, inner.height() * 0.42)
+        mid = cy
         levels = list(self._smooth)
-        n = len(levels)
-        if n == 0:
+        if not levels:
             return
 
-        # fewer visual bars, wider + softer
-        step = max(1, n // 36)
-        samples = levels[::step] or levels
+        # ~28 soft bars
+        target_bars = 28
+        step = max(1, len(levels) // target_bars)
+        samples = levels[::step][:target_bars]
         count = len(samples)
-        gap = 2.6
-        total_gap = gap * (count - 1)
-        bar_w = max(2.4, (wave_right - wave_left - total_gap) / count)
+        if count == 0:
+            return
 
-        # gradient along wave (subtle depth)
+        gap = 2.2
+        bar_w = max(2.2, (wave_right - wave_left - gap * (count - 1)) / count)
+        # Cap bar width so we never overflow horizontally
+        total = count * bar_w + (count - 1) * gap
+        if total > (wave_right - wave_left):
+            bar_w = max(1.8, (wave_right - wave_left - gap * (count - 1)) / count)
+
         grad = QLinearGradient(wave_left, 0, wave_right, 0)
-        grad.setColorAt(0.0, QColor(_WAVE_SOFT))
-        grad.setColorAt(0.5, QColor(_WAVE))
-        grad.setColorAt(1.0, QColor(_WAVE_SOFT))
-
+        grad.setColorAt(0.0, _WAVE_DIM)
+        grad.setColorAt(0.5, _WAVE)
+        grad.setColorAt(1.0, _WAVE_DIM)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(grad)
 
         x = wave_left
         for i, lv in enumerate(samples):
-            # floor so silence still reads as a calm line
-            amp = max(0.08, min(1.0, lv))
-            h = max(3.0, amp * max_h * 2.0)
-            # slight vertical breathing on low energy for life
-            if amp < 0.2:
-                h += 1.2 * math.sin(self._phase * 1.1 + i * 0.4)
-            rr = min(bar_w / 2.0, 3.0)
+            amp = max(0.1, min(1.0, float(lv)))
+            h = max(3.0, amp * max_half * 2.0)
+            # hard clamp inside inner vertical bounds
+            h = min(h, inner.height() - 2.0)
+            rr = min(bar_w * 0.5, 2.5)
             painter.drawRoundedRect(
-                QRectF(x, mid - h / 2, bar_w, h),
+                QRectF(x, mid - h / 2.0, bar_w, h),
                 rr,
                 rr,
             )
             x += bar_w + gap
+            if x > wave_right:
+                break
