@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Whisper launcher — always runs from the app directory.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+if [[ ! -d "$ROOT/.venv" ]]; then
+  echo "[whisper] creating virtualenv (first run)..."
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "error: 'uv' is required (https://github.com/astral-sh/uv)" >&2
+    exit 1
+  fi
+  uv venv --python 3.12 "$ROOT/.venv"
+  uv pip install --python "$ROOT/.venv/bin/python" -e "$ROOT"
+fi
+
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$ROOT/.venv/bin/python" -m whisper_app "$@"

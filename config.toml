@@ -1,0 +1,34 @@
+# Whisper — configuration
+# Paths relative to the program directory are resolved from the app root.
+
+[hotkey]
+# Toggle listen/stop. Format: modifiers+key (ctrl, alt, shift, super)
+toggle = "ctrl+space"
+# Cancel current recording without pasting
+cancel = "escape"
+
+[model]
+# Hugging Face model id (used only for first download)
+repo_id = "nvidia/parakeet-tdt-0.6b-v3"
+# Local folder under the program directory (offline after download)
+path = "models/parakeet-tdt-0.6b-v3"
+# auto | cuda | cpu  — auto tries GPU (NVIDIA CUDA / AMD ROCm) then CPU
+device = "auto"
+# auto = model language detection; or a language code like "pt", "en"
+language = "auto"
+# float16 on GPU saves VRAM; float32 on CPU is safer
+dtype = "auto"
+
+[audio]
+sample_rate = 16000
+# null / omit = system default input
+device = ""
+channels = 1
+
+[paste]
+# Milliseconds to wait after setting clipboard before sending Ctrl+V
+delay_ms = 80
+
+[ui]
+# Overlay shows only while recording / processing
+show_waveform = true
